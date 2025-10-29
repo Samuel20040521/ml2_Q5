@@ -206,13 +206,20 @@ def run_train(args: argparse.Namespace) -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     ge2e = GE2ELoss().to(device) if args.ge2e_weight > 0.0 else None
 
-    resume_epoch = 0
+    global_step = 0
+    start_epoch = 1
+    start_step_in_epoch = 0
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
-        resume_epoch = ckpt.get("epoch", 0)
+        start_epoch = max(ckpt.get("epoch", 1), 1)
+        has_epoch_step = "epoch_step" in ckpt
+        start_step_in_epoch = max(ckpt.get("epoch_step", 0), 0) if has_epoch_step else 0
+        if not has_epoch_step:
+            start_epoch = min(start_epoch + 1, args.epochs + 1)
+        global_step = max(ckpt.get("global_step", 0), 0)
 
     train_loader = DataLoader(
         GameDataset(train_backend, train_records, random_start=True),
@@ -235,14 +242,80 @@ def run_train(args: argparse.Namespace) -> None:
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(resume_epoch + 1, args.epochs + 1):
+    checkpoint_pattern = f"{args.run_name}_*.pt"
+    saved_checkpoints: List[Path] = sorted(save_dir.glob(checkpoint_pattern))
+    if args.keep_last and len(saved_checkpoints) > args.keep_last:
+        for old_path in saved_checkpoints[:-args.keep_last]:
+            try:
+                old_path.unlink()
+            except FileNotFoundError:
+                pass
+        saved_checkpoints = saved_checkpoints[-args.keep_last :]
+
+    def register_checkpoint(path: Path) -> None:
+        saved_checkpoints.append(path)
+        if args.keep_last and len(saved_checkpoints) > args.keep_last:
+            old_path = saved_checkpoints.pop(0)
+            if old_path != path:
+                try:
+                    old_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def save_checkpoint(tag: str, epoch_num: int, epoch_step: int) -> None:
+        payload = {
+            "epoch": epoch_num,
+            "epoch_step": epoch_step,
+            "global_step": global_step,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "player_ids": train_backend.player_ids,
+            "meta": {
+                "in_ch": train_backend.in_ch,
+                "num_classes": len(label_map),
+                "d_move": args.d_move,
+                "d_seq": args.d_seq,
+                "d_vec": args.d_vec,
+                "cnn_depth": args.cnn_depth,
+                "seq_type": args.seq_type,
+                "dropout": args.dropout,
+                "per_move_dropout": args.per_move_dropout,
+            },
+            "args": vars(args),
+        }
+        save_path = save_dir / f"{args.run_name}_{tag}.pt"
+        torch.save(payload, save_path)
+        register_checkpoint(save_path)
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_step_offset = start_step_in_epoch if epoch == start_epoch else 0
+        total_batches = len(train_loader)
+        if epoch_step_offset >= total_batches:
+            start_step_in_epoch = 0
+            continue
+
         model.train()
-        pbar = tqdm(train_loader, desc=f"train {epoch}")
         running_loss = 0.0
         running_acc = 0.0
         steps = 0
+        pbar = tqdm(total=total_batches, desc=f"train {epoch}")
+        if epoch_step_offset:
+            pbar.update(epoch_step_offset)
 
-        for frames, mask, labels, _, _ in pbar:
+        data_iter = iter(train_loader)
+        for _ in range(epoch_step_offset):
+            try:
+                next(data_iter)
+            except StopIteration:
+                data_iter = iter([])
+                break
+
+        last_epoch_step = epoch_step_offset
+        for batch_idx, batch in enumerate(data_iter, start=epoch_step_offset + 1):
+            frames, mask, labels, _, _ = batch
+            last_epoch_step = batch_idx
+
             frames = frames.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -266,38 +339,24 @@ def run_train(args: argparse.Namespace) -> None:
 
             running_loss += loss.item()
             steps += 1
+            global_step += 1
             avg_loss = running_loss / steps
             avg_acc = running_acc / steps if steps > 0 else 0.0
             pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{avg_acc:.4f}")
+            pbar.update(1)
+
+            if args.save_interval and global_step % args.save_interval == 0:
+                save_checkpoint(f"step{global_step}", epoch, last_epoch_step)
+
             if args.max_steps and steps >= args.max_steps:
                 break
 
+        pbar.close()
         if val_loader:
             evaluate(model, val_loader, device, epoch, args.max_eval_batches)
 
-        save_path = save_dir / f"{args.run_name}_epoch{epoch}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict(),
-                "player_ids": train_backend.player_ids,
-                "meta": {
-                    "in_ch": train_backend.in_ch,
-                    "num_classes": len(label_map),
-                    "d_move": args.d_move,
-                    "d_seq": args.d_seq,
-                    "d_vec": args.d_vec,
-                    "cnn_depth": args.cnn_depth,
-                    "seq_type": args.seq_type,
-                    "dropout": args.dropout,
-                    "per_move_dropout": args.per_move_dropout,
-                },
-                "args": vars(args),
-            },
-            save_path,
-        )
+        save_checkpoint(f"epoch{epoch}", epoch, last_epoch_step)
+        start_step_in_epoch = 0
 
 
 def evaluate(model: Model, loader: DataLoader, device: torch.device, epoch: int, max_batches: int = 0) -> None:
@@ -435,6 +494,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=32)
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=0,
+        help="Number of optimizer steps between intra-epoch checkpoints (0 disables).",
+    )
+    parser.add_argument(
+        "--keep_last",
+        type=int,
+        default=0,
+        help="Keep only the most recent N checkpoints (0 keeps all).",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
