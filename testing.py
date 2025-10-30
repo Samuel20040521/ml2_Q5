@@ -1,4 +1,3 @@
-<<<<<<< ours
 import argparse 
 import glob 
 from numpy import dot 
@@ -110,18 +109,3 @@ if __name__ == "__main__":
     style_py.load_config_file(args.conf_file)
     test = style_detection(args.conf_file, args.game_type)
     test.testing()
-=======
-import argparse
-from Q5 import build_argument_parser, run_infer
-
-
-def main() -> None:
-    parser = build_argument_parser()
-    parser.set_defaults(mode="infer")
-    args = parser.parse_args()
-    run_infer(args)
-
-
-if __name__ == "__main__":
-    main()
->>>>>>> theirs
