@@ -89,7 +89,12 @@ class LSTMEncoder(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    """Optional Transformer-based encoder for experimentation."""
+    """Transformer encoder with positional encoding and optional CLS pooling.
+
+    This better matches the ViT-style aggregation described in the paper by
+    adding (1) positional information and (2) a learnable class token to pool
+    the whole sequence, which typically improves identification quality.
+    """
 
     def __init__(
         self,
@@ -99,6 +104,8 @@ class TransformerEncoder(nn.Module):
         num_layers: int = 4,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
+        use_cls: bool = True,
+        max_len: int = 1024,
     ) -> None:
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -114,15 +121,49 @@ class TransformerEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
         self.out_dim = d_model
+        self.use_cls = use_cls
+
+        # Sinusoidal positional embeddings (buffer, no grad) for variable length.
+        pe = self._build_sinusoidal_positional_encoding(max_len, d_model)
+        self.register_buffer("pos_table", pe, persistent=False)
+        # Learnable class token for global pooling when enabled.
+        if self.use_cls:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    @staticmethod
+    def _build_sinusoidal_positional_encoding(max_len: int, d_model: int) -> torch.Tensor:
+        position = torch.arange(max_len).float().unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)  # (1, L, D)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, D_in); mask: (B, T) with 1 for valid tokens
         key_padding_mask = None
         if mask is not None:
             key_padding_mask = ~(mask.bool())
         x = self.input_proj(x)
+        B, T, D = x.shape
+        pos = self.pos_table[:, :T, :]
+        x = x + pos
+
+        if self.use_cls:
+            cls = self.cls_token.expand(B, -1, -1)
+            x = torch.cat([cls, x], dim=1)
+            if key_padding_mask is not None:
+                false_col = torch.zeros(B, 1, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
+                key_padding_mask = torch.cat([false_col, key_padding_mask], dim=1)
+
         seq_out = self.encoder(x, src_key_padding_mask=key_padding_mask)
         seq_out = self.norm(seq_out)
-        pooled = masked_mean(seq_out, mask)
+
+        if self.use_cls:
+            pooled = seq_out[:, 0, :]
+        else:
+            pooled = masked_mean(seq_out, mask)
         return seq_out, pooled
 
 
@@ -154,6 +195,34 @@ class RankHead(nn.Module):
         return self.linear(x)
 
 
+class CosineClassifier(nn.Module):
+    """Cosine classifier with optional additive margin and scaling.
+
+    Normalizes features and weights to compute cosine similarities. During
+    training, if labels are provided and a positive margin is configured, an
+    additive margin is applied to the target class logit (ArcFace-like). At
+    evaluation, it reduces to scaled cosine similarities.
+    """
+
+    def __init__(self, input_dim: int, num_classes: int, scale: float = 16.0, margin: float = 0.0) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_classes, input_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = float(scale)
+        self.margin = float(margin)
+
+    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x_n = F.normalize(x, dim=-1)
+        w_n = F.normalize(self.weight, dim=-1)
+        logits = torch.matmul(x_n, w_n.t()).clamp(-1.0, 1.0)
+        if self.training and labels is not None and self.margin > 0.0:
+            with torch.no_grad():
+                one_hot = torch.zeros_like(logits)
+                one_hot.scatter_(1, labels.view(-1, 1), 1.0)
+            logits = logits - one_hot * self.margin
+        return logits * self.scale
+
+
 class Model(nn.Module):
     """Full style encoder combining per-move CNN, sequence model, and projection head."""
 
@@ -168,6 +237,9 @@ class Model(nn.Module):
         num_classes: Optional[int] = None,
         dropout: float = 0.1,
         per_move_dropout: float = 0.0,
+        logit_head: str = "linear",
+        cosine_scale: float = 16.0,
+        cosine_margin: float = 0.0,
     ) -> None:
         super().__init__()
         self.per_move = PerMoveCNN(in_ch, width=d_seq, depth=cnn_depth, d_move=d_move, dropout=per_move_dropout)
@@ -176,9 +248,20 @@ class Model(nn.Module):
         else:
             self.seq_encoder = LSTMEncoder(d_move, hidden_dim=d_seq // 2, dropout=dropout)
         self.proj = ProjectionHead(self.seq_encoder.out_dim, hidden=d_seq, output_dim=d_vec, dropout=dropout)
-        self.rank_head = RankHead(d_vec, num_classes) if num_classes is not None else None
+        if num_classes is not None:
+            if logit_head == "cosine":
+                self.rank_head = CosineClassifier(d_vec, num_classes, scale=cosine_scale, margin=cosine_margin)
+            else:
+                self.rank_head = RankHead(d_vec, num_classes)
+        else:
+            self.rank_head = None
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if x.dim() != 5:
             raise ValueError(f"Expected input of shape (B, T, C, H, W), got {tuple(x.shape)}")
         b, t, _, _, _ = x.shape
@@ -188,7 +271,12 @@ class Model(nn.Module):
             mask = mask.to(per_move.dtype)
         _, pooled = self.seq_encoder(per_move, mask)
         vector = self.proj(pooled)
-        logits = self.rank_head(vector) if self.rank_head is not None else None
+        logits = None
+        if self.rank_head is not None:
+            if isinstance(self.rank_head, CosineClassifier):
+                logits = self.rank_head(vector, labels=labels)
+            else:
+                logits = self.rank_head(vector)
         return vector, logits
 
 
